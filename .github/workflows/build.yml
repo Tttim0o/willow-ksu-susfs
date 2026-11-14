@@ -94,7 +94,8 @@ jobs:
         working-directory: kernel
         run: |
           cd drivers/kernelsu
-          patch -p1 --batch --fuzz=3 -N < ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
+          # susfs4ksu je naklonovane v koreni workspace (../susfs4ksu z kernel/), takze z drivers/kernelsu su to tri urovne
+          patch -p1 --batch --fuzz=3 -N < ../../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
           cd ../..
           grep -q "KSU_SUSFS" drivers/kernelsu/kernel/Kconfig && echo "OK KSU_SUSFS" || \
             { echo "CHYBA: KSU_SUSFS Kconfig patch zlyhal"; exit 1; }
