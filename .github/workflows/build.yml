@@ -1,4 +1,4 @@
-name: Build willow KSU-Next + SUSFS Kernel
+name: Build willow KSU + SUSFS Kernel
 
 on:
   workflow_dispatch:
@@ -12,22 +12,28 @@ on:
         required: false
         default: ""
 
+# Overeny recept (lokalne zbuildene, Image.gz + KSU + SUSFS):
+#   - base: FloppyKernel (ma uz manualne ksu_handle_* hooky pre non-GKI)
+#   - KSU: tiann/KernelSU @ v0.9.5 (posledna verzia s non-GKI podporou; SUSFS 4.14 patch na nu sadne na 0 rejectov)
+#   - kprobes hooky vypnute -> KSU ide cez manualne hooky z Floppy (non-GKI)
+#   - SUSFS: simonpunk/susfs4ksu branch kernel-4.14
+#   - fix_cred_rcu: Floppy ma cred.usage ako atomic_long_t, treba atomic_long_inc_not_zero
 jobs:
   build:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     env:
-      # Redmi Note 8T = willow (SM6125). PixelOS 17 stock kernel je vendor/ginkgo-perf_defconfig,
-      # presne ten isty config nechavame, aby vermagic sedel so stock vendor .ko modulmi.
       DEFCONFIG: "vendor/ginkgo-perf_defconfig"
       KERNEL_SRC: "https://github.com/FlopKernel-Series/flop_trinket-mi_kernel"
+      KSU_REPO: "https://github.com/tiann/KernelSU"
+      KSU_TAG: "v0.9.5"
       SUSFS_BRANCH: "kernel-4.14"
       SUSFS_MAIN_PATCH: "50_add_susfs_in_kernel-4.14.patch"
       ANYKERNEL: "https://github.com/osm0sis/AnyKernel3"
 
     steps:
-      - name: Checkout tohto repozitara (scripts/, workflow)
+      - name: Checkout tohto repozitara (scripts/, anykernel/, workflow)
         uses: actions/checkout@v4
 
       - name: Priprava prostredia
@@ -39,9 +45,8 @@ jobs:
 
       - name: Stiahni kernel zdrojaky (FloppyKernel SM6125)
         run: |
-          git clone --depth=1 -b "${{ github.event.inputs.kernel_ref }}" \
-            "$KERNEL_SRC" kernel
-          echo "=== verzia kernelu (ma byt 4.14.x; stock willow = 4.14.357) ==="
+          git clone --depth=1 -b "${{ github.event.inputs.kernel_ref }}" "$KERNEL_SRC" kernel
+          echo "=== verzia kernelu ==="
           grep -E '^VERSION|^PATCHLEVEL|^SUBLEVEL' kernel/Makefile
 
       - name: Cache ccache
@@ -57,106 +62,60 @@ jobs:
           git clone --depth=1 https://github.com/kdrag0n/proton-clang "$GITHUB_WORKSPACE/clang"
           "$GITHUB_WORKSPACE/clang/bin/clang" --version | head -1
 
-      - name: Integruj KernelSU-Next (legacy vetva - non-GKI 4.14 ma manualne hooky)
+      - name: SUSFS do kernel stromu (fs/, include/, 50_add patch)
         working-directory: kernel
         run: |
-          # legacy vetva setup.sh je jedina, ktora na non-GKI 4.14 doplni driver + manualne
-          # kernel hooky. 1.0+ GKI-only vetva by sa sem nedala integrovat.
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
-          echo "=== kontrola, ci pribudol KSU driver ==="
-          test -d KernelSU-Next/kernel && echo "OK: KernelSU-Next/kernel existuje" || { echo "CHYBA: KSU-Next sa nenaklonoval"; exit 1; }
-
-      - name: Oprava selinux.h (LINUX_VERSION_CODE drift - 4.14 strom hlasi novsie API nez ma)
-        working-directory: kernel
-        run: |
-          if [ -f KernelSU-Next/kernel/selinux/selinux.h ] && \
-             grep -q "KERNEL_VERSION(5, 10, 0)) || defined(KSU_COMPAT_HAS_SELINUX_STATE)" \
-              KernelSU-Next/kernel/selinux/selinux.h; then
-            python3 "$GITHUB_WORKSPACE/scripts/fix_selinux_compat.py"
-          fi
-
-      - name: Compat shim pre linux/pgtable.h (4.14 ma pgtable iba pod asm/pgtable.h)
-        working-directory: kernel
-        run: |
-          if [ ! -f include/linux/pgtable.h ]; then
-            cat > include/linux/pgtable.h <<'EOF'
-          /* Compat shim: 4.14 kernel ma pgtable iba pod asm/pgtable.h,
-           * ale KernelSU-Next uz ocakava linux/pgtable.h (5.8+). */
-          #ifndef _COMPAT_LINUX_PGTABLE_H
-          #define _COMPAT_LINUX_PGTABLE_H
-          #include <asm/pgtable.h>
-          #endif
-          EOF
-            echo "OK: vytvoreny compat shim include/linux/pgtable.h"
-          fi
-
-      - name: Oprava pkg_observer.c (nespolahlivy LINUX_VERSION_CODE v tomto strome)
-        working-directory: kernel
-        run: |
-          PO=KernelSU-Next/kernel/manager/pkg_observer.c
-          if [ -f "$PO" ]; then
-            grep -q "handle_inode_event" include/linux/fsnotify_backend.h && \
-              echo "POZOR: strom ma nove fsnotify API, prehodnotit" || \
-              echo "OK: strom ma stare fsnotify API (handle_event)"
-            sed -i 's/#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)/#if 0 \/* vynutene: 4.14 strom ma len stare fsnotify_ops API *\//' "$PO"
-            printf '%s\n' '#ifndef TWA_RESUME' '#define TWA_RESUME true' '#endif' > /tmp/twa_shim.h
-            cat /tmp/twa_shim.h "$PO" > /tmp/pkg_observer_new.c
-            mv /tmp/pkg_observer_new.c "$PO"
-          else
-            echo "pkg_observer.c neexistuje v tejto vetve KSU-Next, nic netreba"
-          fi
-
-      - name: Aplikuj SUSFS patche (4.14 vetva)
-        working-directory: kernel
-        run: |
-          git clone --depth=1 -b "$SUSFS_BRANCH" \
-            https://gitlab.com/simonpunk/susfs4ksu.git ../susfs4ksu
-
-          echo "=== 1. Nove SUSFS zdrojove subory ==="
+          git clone --depth=1 -b "$SUSFS_BRANCH" https://gitlab.com/simonpunk/susfs4ksu.git ../susfs4ksu
           cp ../susfs4ksu/kernel_patches/fs/* fs/ 2>/dev/null || true
           cp ../susfs4ksu/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
-
-          echo "=== 2. SUSFS hooky do KernelSU-Next ==="
-          cd KernelSU-Next
-          set +e
-          patch -p1 --batch --fuzz=3 -N < ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch 2>&1 | tee /tmp/ksu_susfs_patch.log
-          set -e
-          cd ..
-          grep -q "KSU_SUSFS" KernelSU-Next/kernel/Kconfig && echo "OK: Kconfig ma KSU_SUSFS" || \
-            { echo "CHYBA: Kconfig patch zlyhal, SUSFS sa nezapne"; exit 1; }
-
-          echo "=== 3. Hlavny SUSFS patch do kernel stromu ==="
           patch -p1 --batch --fuzz=3 -N < "../susfs4ksu/kernel_patches/$SUSFS_MAIN_PATCH" || \
-            echo "VAROVANIE: niektore hunky nesadli, dolepujem rucne nizsie"
-
-          echo "=== 4. Rucna oprava hunkov, ktore nesadli ==="
+            echo "VAROVANIE: niektore 50_add hunky nesadli, dolepujem rucne"
           if ! grep -q "CONFIG_KSU_SUSFS" include/linux/mount.h; then
             python3 "$GITHUB_WORKSPACE/scripts/fix_mount_h.py"
           fi
           if [ -f fs/proc/task_mmu.c ] && ! grep -q "susfs_def.h" fs/proc/task_mmu.c; then
             python3 "$GITHUB_WORKSPACE/scripts/fix_task_mmu.py"
           fi
-          if grep -q "bool is_zygote_child = is_zygote(old->security)" KernelSU-Next/kernel/core_hook.c 2>/dev/null; then
-            python3 "$GITHUB_WORKSPACE/scripts/fix_core_hook.py"
-          fi
-          if grep -q "^bool is_manager_apk" KernelSU-Next/kernel/apk_sign.c 2>/dev/null; then
-            python3 "$GITHUB_WORKSPACE/scripts/fix_apk_sign.py"
-          fi
-          if grep -q "strncpy_from_unsafe_user" KernelSU-Next/kernel/kernel_compat.c 2>/dev/null; then
-            python3 "$GITHUB_WORKSPACE/scripts/fix_kernel_compat.py"
-          fi
           rm -f fs/proc/task_mmu.c.rej include/linux/mount.h.rej 2>/dev/null || true
+
+      - name: KernelSU (tiann v0.9.5) do drivers/kernelsu + vypni kprobe hooky
+        working-directory: kernel
+        run: |
+          rm -rf drivers/kernelsu
+          git clone "$KSU_REPO" drivers/kernelsu
+          git -C drivers/kernelsu checkout "$KSU_TAG"
+          echo "KSU: $(git -C drivers/kernelsu describe --tags)"
+          # non-GKI: KSU ma ist cez manualne ksu_handle_* hooky, ktore Floppy uz ma v fs/*.c,
+          # nie cez kprobes. Vypneme vsetky kprobe hooky v KSU.
+          find drivers/kernelsu/kernel -type f \( -name '*.c' -o -name '*.h' \) \
+            -exec sed -i 's/#ifdef CONFIG_KPROBES/#if defined(CONFIG_KPROBES) \&\& 0/g' {} +
+
+      - name: SUSFS hooky do KernelSU (10_enable, na v0.9.5 sadne na 0 rejectov)
+        working-directory: kernel
+        run: |
+          cd drivers/kernelsu
+          patch -p1 --batch --fuzz=3 -N < ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
+          cd ../..
+          grep -q "KSU_SUSFS" drivers/kernelsu/kernel/Kconfig && echo "OK KSU_SUSFS" || \
+            { echo "CHYBA: KSU_SUSFS Kconfig patch zlyhal"; exit 1; }
+
+      - name: Oprava get_cred_rcu (Floppy ma cred.usage = atomic_long_t)
+        working-directory: kernel
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/fix_cred_rcu.py"
 
       - name: Zapni KSU/SUSFS v defconfigu (non-GKI bezpecna sada)
         working-directory: kernel
         run: |
-          # POZOR: na non-GKI NEPRIDAVAM mnt_id_reorder ani SUS_SU - oboje na non-GKI
-          # bootloopuje / nie je podporovane. To je presne to, co zhodilo FloppyKernel KSU build.
-          cat >> "arch/arm64/configs/$DEFCONFIG" <<'EOF'
+          # mnt_id_reorder a SUS_SU na non-GKI zamerne VYNECHANE (bootloop / nepodporovane).
+          DC="arch/arm64/configs/$DEFCONFIG"
+          sed -i '/^CONFIG_KSU/d;/^CONFIG_TMPFS_XATTR=y/d' "$DC"
+          cat >> "$DC" <<'EOF'
           CONFIG_KSU=y
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
           CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
           CONFIG_KSU_SUSFS_SUS_KSTAT=y
           CONFIG_KSU_SUSFS_TRY_UMOUNT=y
           CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
@@ -173,26 +132,22 @@ jobs:
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           export ARCH=arm64 SUBARCH=arm64
           export KBUILD_BUILD_USER=claude KBUILD_BUILD_HOST=github-actions
-          export CCACHE_DIR="$HOME/.ccache"
-          export CCACHE_MAXSIZE=3G
-          ccache --zero-stats || true
-          MAKE_ARGS=(O=out ARCH=arm64 "CC=ccache clang" LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-)
-          make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+          export CCACHE_DIR="$HOME/.ccache" CCACHE_MAXSIZE=5G
+          MA=(O=out ARCH=arm64 "CC=ccache clang" LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-)
+          make "${MA[@]}" "$DEFCONFIG"
           grep -q "CONFIG_KSU=y" out/.config || { echo "CHYBA: KSU nie je v .config"; exit 1; }
           grep -q "CONFIG_KSU_SUSFS=y" out/.config || { echo "CHYBA: SUSFS nie je v .config"; exit 1; }
-          echo "OK: KSU aj SUSFS su zapnute"
-          make -j"$(nproc)" "${MAKE_ARGS[@]}" KCFLAGS="-Wno-error"
-          ccache --show-stats || true
+          make -j"$(nproc)" "${MA[@]}" KCFLAGS="-Wno-error"
+          ls -la out/arch/arm64/boot/Image.gz
 
-      - name: Zabal AnyKernel3 zip
+      - name: Zabal AnyKernel3 zip (willow anykernel.sh)
         run: |
           git clone --depth=1 "$ANYKERNEL" ak3
-          rm -f ak3/Image ak3/Image.gz ak3/Image.gz-dtb ak3/dtb* 2>/dev/null || true
-          cp kernel/out/arch/arm64/boot/Image.gz ak3/ 2>/dev/null || \
-            cp kernel/out/arch/arm64/boot/Image ak3/
-          cp kernel/out/arch/arm64/boot/dtb* ak3/ 2>/dev/null || true
-          cp kernel/out/arch/arm64/boot/dtbo.img ak3/ 2>/dev/null || true
-          cd ak3 && zip -r9 ../willow-KSUNext-SUSFS.zip . -x ".git*"
+          rm -f ak3/Image* ak3/dtb* ak3/zImage* 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/anykernel/anykernel.sh" ak3/anykernel.sh
+          cp kernel/out/arch/arm64/boot/Image.gz ak3/
+          find kernel/out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + > ak3/dtb 2>/dev/null || true
+          cd ak3 && zip -r9 ../willow-KSU-SUSFS.zip . -x ".git*"
 
       - name: (volitelne) Vyrob hotovy boot.img
         if: ${{ github.event.inputs.stock_boot_url != '' }}
@@ -200,21 +155,18 @@ jobs:
           wget -q "https://github.com/topjohnwu/Magisk/releases/latest/download/Magisk-v28.1.apk" -O magisk.apk || \
             wget -q "https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk" -O magisk.apk
           unzip -o magisk.apk "lib/x86_64/*" -d magisk
-          cp magisk/lib/x86_64/libmagiskboot.so ./magiskboot
-          chmod +x magiskboot
+          cp magisk/lib/x86_64/libmagiskboot.so ./magiskboot && chmod +x magiskboot
           curl -LSs "${{ github.event.inputs.stock_boot_url }}" -o stock-boot.img
           ./magiskboot unpack stock-boot.img
-          # willow ma Image.gz v boot.img
-          gzip -n -9 -c kernel/out/arch/arm64/boot/Image > kernel 2>/dev/null || \
-            cp kernel/out/arch/arm64/boot/Image.gz kernel
+          cp kernel/out/arch/arm64/boot/Image.gz-dtb kernel 2>/dev/null || cp kernel/out/arch/arm64/boot/Image.gz kernel
           ./magiskboot repack stock-boot.img new-boot.img
 
       - name: Nahraj artefakty
         uses: actions/upload-artifact@v4
         with:
-          name: willow-KSUNext-SUSFS
+          name: willow-KSU-SUSFS
           path: |
-            willow-KSUNext-SUSFS.zip
+            willow-KSU-SUSFS.zip
             new-boot.img
 
       - name: Vytvor prerelease
@@ -225,20 +177,21 @@ jobs:
           cat > notes.md <<'EOF'
           ## NETESTOVANY, EXPERIMENTALNY BUILD
 
-          Kernel pre **Redmi Note 8T (willow, SM6125)** na **PixelOS 17 (Android 17)** s **KernelSU-Next + SUSFS**.
+          Kernel pre **Redmi Note 8T (willow, SM6125)** na **PixelOS 17 (Android 17)** s **KernelSU + SUSFS**.
 
           - Build vygenerovany AI (Claude), **NEBOL otestovany na zariadeni**.
           - **NEFLASHUJ naslepo.** Najprv `fastboot boot new-boot.img`, az po overeni `fastboot flash boot`.
           - Vzdy si zalohuj stock `boot.img`.
+          - KSU ide cez manualne hooky (non-GKI), kprobes su vypnute - log hlaska "KPROBES is disabled" je OCAKAVANA.
           - SUSFS non-GKI bootloop-prone funkcie (mnt_id_reorder, SUS_SU) su zamerne vypnute.
           - Autor ani siritel neruci za skody. Flashujes na vlastne riziko.
           EOF
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "willow KSU-Next+SUSFS (netestovany build #${{ github.run_number }})" \
+            --title "willow KSU+SUSFS (netestovany build #${{ github.run_number }})" \
             --prerelease \
             --notes-file notes.md \
-            willow-KSUNext-SUSFS.zip
+            willow-KSU-SUSFS.zip
           if [ -f new-boot.img ]; then
             gh release upload "$TAG" new-boot.img --repo "$GITHUB_REPOSITORY"
           fi
